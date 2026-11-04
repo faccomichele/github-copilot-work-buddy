@@ -24,8 +24,9 @@ PROJECT_LIMIT=200
 ITEM_LIMIT=200
 PROJECT_TARGETS_JSON=''
 
-STATUSES='[["Backlog","GRAY"],["Todo","BLUE"],["Plan review","YELLOW"],["Approved","GREEN"],["In Progress","PURPLE"],["Human review","ORANGE"],["Waiting feedback","PINK"],["Blocked","RED"],["Done","GREEN"]]'
-PRIORITIES='["DO NOW","Urgent","High","Medium","Low"]'
+STATUSES='[["Backlog","PURPLE"],["Todo","BLUE"],["Plan review","YELLOW"],["Approved","GREEN"],["In Progress","ORANGE"],["Human review","YELLOW"],["Waiting feedback","PINK"],["Blocked","RED"],["Done","GREEN"]]'
+PRIORITIES='["Urgent","High","Medium","Low"]'
+PRIORITY_OPTIONS='[["Urgent","RED"],["High","ORANGE"],["Medium","YELLOW"],["Low","BLUE"]]'
 
 usage() {
   cat <<'EOF'
@@ -96,6 +97,13 @@ item_id() {
     --url "https://github.com/$REPO/issues/$NUM" --format json --jq .id
 }
 
+validate_priority() {
+  local value="$1" valid
+  valid=$(jq -r 'join(", ")' <<<"$PRIORITIES")
+  jq -e --arg value "$value" 'any(.[]; ascii_downcase == ($value | ascii_downcase))' \
+    <<<"$PRIORITIES" >/dev/null || die "invalid Priority '$value'; valid: $valid"
+}
+
 # Uses REPO and NUM; matches the option name case-insensitively.
 set_field_in_project() {
   local project_number="$1" field_name="$2" value="$3"
@@ -130,6 +138,7 @@ set_field_in_project() {
 
 set_field() {
   local field_name="$1" value="$2" targets target number successes='' failures=''
+  [[ "$field_name" != "Priority" ]] || validate_priority "$value"
   require_project_targets
   targets=$(project_targets)
   while IFS= read -r target; do
@@ -192,35 +201,72 @@ cmd_config() {
     '{owner: $owner, repoOwner: $repoOwner, project: $project, projects: $projects, trackingRepo: $repo, reposRoot: $root, branchPrefix: $prefix, home: $home}'
 }
 
+read_project_select_options() {
+  local field_id="$1" query response options
+  query='query($id: ID!) { node(id: $id) { ... on ProjectV2SingleSelectField { options { id name color description } } } }'
+  response=$(jq -cn --arg query "$query" --arg id "$field_id" \
+    '{query: $query, variables: {id: $id}}' | gh api graphql --input -) || {
+    echo "yo-gh: could not read options for field $field_id" >&2
+    return 1
+  }
+  if ! options=$(jq -c '.data.node.options | if type == "array" then . else error("expected options array") end' <<<"$response"); then
+    echo "yo-gh: invalid options response for field $field_id" >&2
+    return 1
+  fi
+  printf '%s\n' "$options"
+}
+
+update_project_select_options() {
+  local field_id="$1" options="$2" query
+  query='mutation($fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) { updateProjectV2Field(input: {fieldId: $fieldId, singleSelectOptions: $options}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }'
+  jq -cn --arg query "$query" --arg fieldId "$field_id" --argjson options "$options" \
+    '{query: $query, variables: {fieldId: $fieldId, options: $options}}' |
+    gh api graphql --input - >/dev/null
+}
+
+create_project_select_field() {
+  local project_number="$1" field_name="$2" options="$3" project_id query
+  project_id=$(gh project view "$project_number" --owner "$OWNER" --format json --jq .id) || {
+    echo "yo-gh: could not read project #$project_number id" >&2
+    return 1
+  }
+  query='mutation($projectId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) { createProjectV2Field(input: {projectId: $projectId, name: $name, dataType: SINGLE_SELECT, singleSelectOptions: $options}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }'
+  jq -cn --arg query "$query" --arg projectId "$project_id" --arg name "$field_name" --argjson options "$options" \
+    '{query: $query, variables: {projectId: $projectId, name: $name, options: $options}}' |
+    gh api graphql --input - >/dev/null
+}
+
 ensure_status_options() {
-  local project_number="$1" fields fid missing count opts page
+  local project_number="$1" fields fid existing opts
   fields=$(gh project field-list "$project_number" --owner "$OWNER" --format json) || {
     echo "yo-gh: could not read fields for project #$project_number" >&2
     return 1
   }
   fid=$(jq -r '.fields[] | select(.name == "Status") | .id' <<<"$fields")
-  [[ -n "$fid" ]] || { echo "yo-gh: project #$project_number has no Status field" >&2; return 1; }
-  missing=$(jq -r --argjson want "$STATUSES" '
-    ([.fields[] | select(.name == "Status") | .options[].name]) as $have
-    | [$want[][0] | select(. as $s | $have | index($s) | not)] | join(", ")' <<<"$fields")
-  if [[ -z "$missing" ]]; then
+  opts=$(jq -cn --argjson want "$STATUSES" '[$want[] | {name: .[0], color: .[1], description: ""}]') || return 1
+  if [[ -z "$fid" ]]; then
+    if ! create_project_select_field "$project_number" Status "$opts"; then
+      echo "yo-gh: could not create Status field in project #$project_number" >&2
+      return 1
+    fi
+    echo "Project #$project_number: Status field created"
+    return
+  fi
+  existing=$(read_project_select_options "$fid") || {
+    echo "yo-gh: could not read Status options for project #$project_number" >&2
+    return 1
+  }
+  opts=$(jq -cn --argjson want "$STATUSES" --argjson have "$existing" '
+    [$want[] as $wanted
+      | ($have | map(select((.name | ascii_downcase) == ($wanted[0] | ascii_downcase))) | .[0] // null) as $old
+      | {name: $wanted[0], color: $wanted[1], description: ""}
+        + (if ($old.id? // "") == "" then {} else {id: $old.id} end)
+    ]') || return 1
+  if jq -e --argjson want "$opts" '. == $want' <<<"$existing" >/dev/null; then
     echo "Project #$project_number: Status options already complete"
     return
   fi
-  page=$(project_items "$project_number") || {
-    echo "yo-gh: could not list items in project #$project_number" >&2
-    return 1
-  }
-  count=$(jq '.items | length' <<<"$page")
-  if [[ "$count" -gt 0 ]]; then
-    # Rewriting the options would clear the Status of existing items.
-    echo "Project #$project_number: add these Status options in project settings (Status field): $missing"
-    return
-  fi
-  opts=$(jq -c --argjson want "$STATUSES" -n '[$want[] | {name: .[0], color: .[1], description: ""}]')
-  if ! jq -n --arg f "$fid" --argjson o "$opts" '{
-      query: "mutation($f: ID!, $o: [ProjectV2SingleSelectFieldOptionInput!]!) { updateProjectV2Field(input: {fieldId: $f, singleSelectOptions: $o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }",
-      variables: {f: $f, o: $o}}' | gh api graphql --input - >/dev/null; then
+  if ! update_project_select_options "$fid" "$opts"; then
     echo "yo-gh: could not update Status options in project #$project_number" >&2
     return 1
   fi
@@ -228,7 +274,8 @@ ensure_status_options() {
 }
 
 cmd_setup() {
-  local num targets target number fields failed=0
+  local num targets target number fields failed=0 priority_options
+  priority_options=$(jq -cn --argjson want "$PRIORITY_OPTIONS" '[ $want[] | {name: .[0], color: .[1], description: ""} ]') || return 1
   if [[ -n "$PROJECT" ]] && ! gh project view "$PROJECT" --owner "$OWNER" >/dev/null 2>&1; then
     num=$(gh project create --owner "$OWNER" --title TODO --format json | jq -r .number)
     echo "Created project #$num; set YO_PROJECT=$num in yo.env"
@@ -247,8 +294,7 @@ cmd_setup() {
       failed=1
     elif jq -e '.fields[] | select(.name == "Priority")' >/dev/null <<<"$fields"; then
       echo "Project #$number: Priority field already exists"
-    elif gh project field-create "$number" --owner "$OWNER" --name Priority \
-      --data-type SINGLE_SELECT --single-select-options "$(jq -r 'join(",")' <<<"$PRIORITIES")" >/dev/null; then
+    elif create_project_select_field "$number" Priority "$priority_options"; then
       echo "Project #$number: Priority field created"
     else
       echo "yo-gh: could not create Priority field for project #$number" >&2
@@ -308,6 +354,7 @@ cmd_create() {
     shift 2
   done
   local url failed=0
+  [[ -z "$priority" ]] || validate_priority "$priority"
   require_project_targets
   url=$(gh issue create -R "$repo" --title "$title" --body "$body" ${extra[@]+"${extra[@]}"})
   REPO="$repo"; NUM="${url##*/}"
@@ -319,7 +366,7 @@ cmd_create() {
 }
 
 cmd_status() { parse_ref "$1"; set_field Status "$2"; }
-cmd_priority() { parse_ref "$1"; set_field Priority "$2"; }
+cmd_priority() { parse_ref "$1"; validate_priority "$2"; set_field Priority "$2"; }
 
 cmd_comment() {
   parse_ref "$1"

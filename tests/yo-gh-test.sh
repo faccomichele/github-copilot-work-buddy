@@ -11,6 +11,10 @@ unset YO_PROJECT YO_REPO_OWNER
 export YO_REPO=tracker/to-do YO_OWNER=person YO_BRANCH_PREFIX=person
 export YO_TEST_LOG="$TEST_HOME/gh.log"
 : >"$YO_TEST_LOG"
+export YO_TEST_GRAPHQL_LOG="$TEST_HOME/graphql.log"
+: >"$YO_TEST_GRAPHQL_LOG"
+export YO_TEST_STATUS_PAIRS='[["Backlog","PURPLE"],["Todo","BLUE"],["Plan review","YELLOW"],["Approved","GREEN"],["In Progress","ORANGE"],["Human review","YELLOW"],["Waiting feedback","PINK"],["Blocked","RED"],["Done","GREEN"]]'
+export YO_TEST_PRIORITY_PAIRS='[["Urgent","RED"],["High","ORANGE"],["Medium","YELLOW"],["Low","BLUE"]]'
 
 gh() {
   printf '%s\n' "$*" >>"$YO_TEST_LOG"
@@ -50,10 +54,12 @@ gh() {
       fi
       ;;
     'project field-list')
-      if [[ "${YO_TEST_NO_STATUS_PROJECT:-}" == "$3" ]]; then
-        jq -cn --arg p "$3" '{fields:[{id:("F_PRIORITY_" + $p),name:"Priority",options:[{id:("O_PRIORITY_" + $p + "_High"),name:"High"},{id:("O_PRIORITY_" + $p + "_Urgent"),name:"Urgent"},{id:("O_PRIORITY_" + $p + "_DO_NOW"),name:"DO NOW"},{id:("O_PRIORITY_" + $p + "_Medium"),name:"Medium"},{id:("O_PRIORITY_" + $p + "_Low"),name:"Low"}]}]}'
+      if [[ "${YO_TEST_NO_PRIORITY:-}" == 1 ]]; then
+        jq -cn --arg p "$3" '{fields:[{id:("F_STATUS_" + $p),name:"Status",options:[{name:"Backlog"},{name:"Todo"},{name:"Plan review"},{name:"Approved"},{name:"In Progress"},{name:"Human review"},{name:"Waiting feedback"},{name:"Blocked"},{name:"Done"}]}]}'
+      elif [[ "${YO_TEST_NO_STATUS_PROJECT:-}" == "$3" ]]; then
+        jq -cn --arg p "$3" '{fields:[{id:("F_PRIORITY_" + $p),name:"Priority",options:[{id:("O_PRIORITY_" + $p + "_High"),name:"High"},{id:("O_PRIORITY_" + $p + "_Urgent"),name:"Urgent"},{id:("O_PRIORITY_" + $p + "_Medium"),name:"Medium"},{id:("O_PRIORITY_" + $p + "_Low"),name:"Low"}]}]}'
       else
-        jq -cn --arg p "$3" '{fields:[{id:("F_STATUS_" + $p),name:"Status",options:[{id:("O_STATUS_" + $p + "_Backlog"),name:"Backlog"},{id:("O_STATUS_" + $p + "_Todo"),name:"Todo"},{id:("O_STATUS_" + $p + "_Plan review"),name:"Plan review"},{id:("O_STATUS_" + $p + "_Approved"),name:"Approved"},{id:("O_STATUS_" + $p + "_In Progress"),name:"In Progress"},{id:("O_STATUS_" + $p + "_Human review"),name:"Human review"},{id:("O_STATUS_" + $p + "_Waiting feedback"),name:"Waiting feedback"},{id:("O_STATUS_" + $p + "_Blocked"),name:"Blocked"},{id:("O_STATUS_" + $p + "_Done"),name:"Done"}]},{id:("F_PRIORITY_" + $p),name:"Priority",options:[{id:("O_PRIORITY_" + $p + "_High"),name:"High"},{id:("O_PRIORITY_" + $p + "_Urgent"),name:"Urgent"},{id:("O_PRIORITY_" + $p + "_DO_NOW"),name:"DO NOW"},{id:("O_PRIORITY_" + $p + "_Medium"),name:"Medium"},{id:("O_PRIORITY_" + $p + "_Low"),name:"Low"}]}]}'
+        jq -cn --arg p "$3" '{fields:[{id:("F_STATUS_" + $p),name:"Status",options:[{id:("O_STATUS_" + $p + "_Backlog"),name:"Backlog"},{id:("O_STATUS_" + $p + "_Todo"),name:"Todo"},{id:("O_STATUS_" + $p + "_Plan review"),name:"Plan review"},{id:("O_STATUS_" + $p + "_Approved"),name:"Approved"},{id:("O_STATUS_" + $p + "_In Progress"),name:"In Progress"},{id:("O_STATUS_" + $p + "_Human review"),name:"Human review"},{id:("O_STATUS_" + $p + "_Waiting feedback"),name:"Waiting feedback"},{id:("O_STATUS_" + $p + "_Blocked"),name:"Blocked"},{id:("O_STATUS_" + $p + "_Done"),name:"Done"}]},{id:("F_PRIORITY_" + $p),name:"Priority",options:[{id:("O_PRIORITY_" + $p + "_High"),name:"High"},{id:("O_PRIORITY_" + $p + "_Urgent"),name:"Urgent"},{id:("O_PRIORITY_" + $p + "_Medium"),name:"Medium"},{id:("O_PRIORITY_" + $p + "_Low"),name:"Low"}]}]}'
       fi
       ;;
     'project item-list')
@@ -81,7 +87,37 @@ gh() {
         return 1
       fi
       ;;
-    'project field-create') ;;
+    'api graphql')
+      local request query field_id project_number
+      request=$(cat)
+      printf '%s\n' "$request" >>"$YO_TEST_GRAPHQL_LOG"
+      query=$(jq -r '.query' <<<"$request")
+      if [[ "$query" == *'node(id: $id)'* ]]; then
+        field_id=$(jq -r '.variables.id' <<<"$request")
+        project_number="${field_id##*_}"
+        if [[ "${YO_TEST_PARTIAL_STATUS:-}" == "$project_number" ]]; then
+          jq -cn --arg p "$project_number" '{data:{node:{options:[{id:("O_STATUS_" + $p + "_Backlog"),name:"Backlog",color:"GRAY",description:"old description"},{id:("O_STATUS_" + $p + "_Legacy"),name:"Legacy",color:"GRAY",description:"custom"}]}}}'
+        else
+          jq -cn --arg p "$project_number" --argjson pairs "$YO_TEST_STATUS_PAIRS" \
+            '{data:{node:{options:[$pairs[] | {id:("O_STATUS_" + $p + "_" + .[0]),name:.[0],color:.[1],description:""}]}}}'
+        fi
+      elif [[ "$query" == *"updateProjectV2Field"* ]]; then
+        if [[ "${YO_TEST_FAIL_STATUS_UPDATE:-}" == 1 ]]; then
+          printf '%s\n' 'Forced Status option update failure' >&2
+          return 1
+        fi
+        printf '%s\n' '{"data":{"updateProjectV2Field":{"projectV2Field":{"id":"F_STATUS"}}}}'
+      elif [[ "$query" == *"createProjectV2Field"* ]]; then
+        if [[ "${YO_TEST_FAIL_FIELD_CREATE:-}" == 1 ]]; then
+          printf '%s\n' 'Forced field creation failure' >&2
+          return 1
+        fi
+        printf '%s\n' '{"data":{"createProjectV2Field":{"projectV2Field":{"id":"F_CREATED"}}}}'
+      else
+        printf 'Unexpected GraphQL query: %s\n' "$query" >&2
+        return 1
+      fi
+      ;;
     'issue create') printf '%s\n' 'https://github.com/tracker/to-do/issues/99' ;;
     'api repos/tracker/to-do/issues/12/sub_issues') printf '%s\n' '[]' ;;
     'api repos/tracker/to-do/issues/12/parent') printf '%s\n' 'null' ;;
@@ -132,21 +168,87 @@ grep -Fq 'project item-edit --id ITEM_4 --project-id PVT_4 --field-id F_PRIORITY
 grep -Fq 'project item-edit --id ITEM_7 --project-id PVT_7 --field-id F_PRIORITY_7 --single-select-option-id O_PRIORITY_7_Urgent' "$YO_TEST_LOG"
 
 : >"$YO_TEST_LOG"
+if ./scripts/yo-gh priority 12 'DO NOW' >/dev/null 2>&1; then
+  printf '%s\n' 'priority accepted retired DO NOW value' >&2
+  exit 1
+fi
+if grep -q '^project item-add ' "$YO_TEST_LOG"; then
+  printf '%s\n' 'invalid priority caused a project write' >&2
+  exit 1
+fi
+
+: >"$YO_TEST_LOG"
+if ./scripts/yo-gh create 'Invalid priority' --priority 'DO NOW' >/dev/null 2>&1; then
+  printf '%s\n' 'create accepted retired DO NOW value' >&2
+  exit 1
+fi
+if grep -q '^issue create ' "$YO_TEST_LOG"; then
+  printf '%s\n' 'invalid create priority opened an issue' >&2
+  exit 1
+fi
+
+: >"$YO_TEST_LOG"
 ./scripts/yo-gh create 'Created once' --status Todo --priority High >/dev/null
 [[ "$(grep -c '^issue create ' "$YO_TEST_LOG")" -eq 1 ]]
 [[ "$(grep -c '^project item-add ' "$YO_TEST_LOG")" -eq 4 ]]
 
 : >"$YO_TEST_LOG"
+: >"$YO_TEST_GRAPHQL_LOG"
 ./scripts/yo-gh setup >/dev/null
 grep -Fq 'project field-list 4 ' "$YO_TEST_LOG"
 grep -Fq 'project field-list 7 ' "$YO_TEST_LOG"
-
-: >"$YO_TEST_LOG"
-if YO_TEST_NO_STATUS_PROJECT=4 ./scripts/yo-gh setup >/dev/null 2>&1; then
-  printf '%s\n' 'setup succeeded despite a missing Status field' >&2
+jq -s -e '[.[] | select(.query | (contains("updateProjectV2Field") or contains("createProjectV2Field")))] | length == 0' "$YO_TEST_GRAPHQL_LOG" >/dev/null
+if grep -Eq '^project item-(list|edit) ' "$YO_TEST_LOG"; then
+  printf '%s\n' 'complete Status setup unexpectedly inspected or edited project items' >&2
   exit 1
 fi
-grep -Fq 'project field-list 7 ' "$YO_TEST_LOG"
+
+: >"$YO_TEST_LOG"
+: >"$YO_TEST_GRAPHQL_LOG"
+YO_TEST_NO_PRIORITY=1 ./scripts/yo-gh setup >/dev/null
+jq -s -e --argjson pairs "$YO_TEST_PRIORITY_PAIRS" '
+  ([$pairs[] | {name: .[0], color: .[1], description: ""}]) as $expected
+  | [.[] | select(.query | contains("createProjectV2Field")) | .variables | select(.name == "Priority")] as $created
+  | ($created | length) == 2 and all($created[]; .options == $expected)
+' "$YO_TEST_GRAPHQL_LOG" >/dev/null
+
+: >"$YO_TEST_LOG"
+if ! YO_TEST_NO_STATUS_PROJECT=4 ./scripts/yo-gh setup >/dev/null 2>&1; then
+  printf '%s\n' 'setup failed to create a missing Status field' >&2
+  exit 1
+fi
+jq -s -e --argjson pairs "$YO_TEST_STATUS_PAIRS" '
+  ([$pairs[] | {name: .[0], color: .[1], description: ""}]) as $expected
+  | [.[] | select(.query | contains("createProjectV2Field")) | .variables | select(.name == "Status")] as $created
+  | ($created | length) == 1 and $created[0].projectId == "PVT_4" and $created[0].options == $expected
+' "$YO_TEST_GRAPHQL_LOG" >/dev/null
+
+: >"$YO_TEST_LOG"
+: >"$YO_TEST_GRAPHQL_LOG"
+if ! YO_TEST_PARTIAL_STATUS=4 ./scripts/yo-gh setup >/dev/null; then
+  printf '%s\n' 'setup failed to reconcile a populated Status field' >&2
+  exit 1
+fi
+jq -s -e --argjson pairs "$YO_TEST_STATUS_PAIRS" '
+  ([$pairs[] | {name: .[0], color: .[1], description: ""}]) as $expected
+  | [.[] | select(.query | contains("updateProjectV2Field"))] as $updates
+  | ($updates | length) == 1
+    and $updates[0].variables.fieldId == "F_STATUS_4"
+    and ($updates[0].variables.options | map({name, color, description})) == $expected
+    and $updates[0].variables.options[0].id == "O_STATUS_4_Backlog"
+    and all($updates[0].variables.options[]; if .name == "Backlog" then .id == "O_STATUS_4_Backlog" else (has("id") | not) end)
+    and all($updates[0].variables.options[]; .name != "Legacy")
+' "$YO_TEST_GRAPHQL_LOG" >/dev/null
+if grep -Eq '^project item-(list|edit) ' "$YO_TEST_LOG"; then
+  printf '%s\n' 'Status reconciliation unexpectedly inspected or edited project items' >&2
+  exit 1
+fi
+
+: >"$YO_TEST_GRAPHQL_LOG"
+if YO_TEST_PARTIAL_STATUS=4 YO_TEST_FAIL_STATUS_UPDATE=1 ./scripts/yo-gh setup >/dev/null 2>&1; then
+  printf '%s\n' 'setup succeeded despite a Status option update failure' >&2
+  exit 1
+fi
 
 : >"$YO_TEST_LOG"
 if YO_TEST_EMPTY_PROJECTS=1 ./scripts/yo-gh status 12 Todo >/dev/null 2>&1; then

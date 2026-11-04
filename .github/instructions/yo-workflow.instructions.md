@@ -40,7 +40,7 @@ description: "Use when working on GitHub Project tasks: planning, triaging, impl
 | `Blocked` | Stopped by an external factor | Human |
 | `Done` | Finished; only the human sets it (or closes the issue) | — |
 
-Priority values: `DO NOW`, `Urgent`, `High`, `Medium`, `Low`.
+Priority values: `Urgent`, `High`, `Medium`, `Low`.
 
 ## Goals
 - A **goal** is a milestone of the tracking repo: the final outcome several tasks work toward, with a due date and a "done when" description.

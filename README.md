@@ -42,7 +42,7 @@ flowchart LR
 | `Blocked` | Stopped by an external factor |
 | `Done` | Finished (you set it) |
 
-Priority: `DO NOW`, `Urgent`, `High`, `Medium`, `Low`.
+Priority: `Urgent`, `High`, `Medium`, `Low`.
 
 ## Code repos and bolts
 
@@ -81,10 +81,13 @@ workspace root; do not prefix it with `bash` or wrap it in `wsl.exe`.
 1. `gh auth refresh -h github.com -s project` (the login needs the `project` scope; for an org
    with SSO, authorize the token for it).
 2. `cp yo.env.example yo.env` and set at least `YO_REPOS_ROOT` (the folder holding your clones).
-3. `./scripts/yo-gh setup` ensures the Status options and Priority field. With `YO_PROJECT` set,
-  it targets that project and creates it if missing; without it, setup targets every active project
-  owned by `YO_OWNER` (or the tracking repo owner when unset). If a project already has items and
-  lacks Status options, setup lists the options to add by hand.
+3. `./scripts/yo-gh setup` creates missing Status and Priority fields and reconciles existing Status
+  fields to the canonical options, preserving IDs for matching statuses. It removes noncanonical
+  Status options, so items assigned a removed option may lose their Status. New Priority options are
+  color-coded; existing Priority fields are left unchanged. With `YO_PROJECT` set, setup targets
+  that project and creates it if missing; without it, setup targets every active project owned by
+  `YO_OWNER` (or the tracking repo owner when unset). The CLI rejects `DO NOW` even if an old
+  Priority field still exposes it.
 4. Open this repo in VS Code and enable the setting `chat.useCustomAgentHooks` (the terminal guard).
 5. Pick **Work Buddy** in the agent picker and run `/yo-help`.
 
