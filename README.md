@@ -71,6 +71,13 @@ Priority: `DO NOW`, `Urgent`, `High`, `Medium`, `Low`.
 
 ## Setup
 
+On Windows, prefer opening this repo in VS Code through WSL (Remote - WSL); use Git Bash as a
+fallback if WSL is unavailable. Run Work Buddy and `yo-gh` in that same Bash environment. The
+workflow needs `python3` for the agent hook, plus `gh`, `jq`, and `git`. Set `YO_REPOS_ROOT` to a
+path visible from the chosen environment (for example, `/mnt/c/Users/...` for clones on a Windows
+drive in WSL). In Work Buddy's guarded terminal, run `./scripts/yo-gh ...` directly from the
+workspace root; do not prefix it with `bash` or wrap it in `wsl.exe`.
+
 1. `gh auth refresh -h github.com -s project` (the login needs the `project` scope; for an org
    with SSO, authorize the token for it).
 2. `cp yo.env.example yo.env` and set at least `YO_REPOS_ROOT` (the folder holding your clones).

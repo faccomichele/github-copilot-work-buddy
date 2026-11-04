@@ -3,10 +3,14 @@ description: "Use when working on GitHub Project tasks: planning, triaging, impl
 ---
 # GitHub Project workflow rules
 
+## Runtime
+- On Windows, prefer opening this workspace in VS Code through WSL; Git Bash is a fallback if WSL is unavailable. Keep the agent hook, terminal commands, and local repo paths in the same environment. Use paths visible there for `YO_REPOS_ROOT` (for example, `/mnt/c/...` in WSL).
+- The workflow requires Bash, `python3` for the Work Buddy hook, `gh`, `jq`, and `git`.
+
 ## Where the work lives
 - GitHub Projects (Status and Priority fields are the source of truth) plus one **tracking repo** that holds goals (milestones). Run `./scripts/yo-gh config` once per session for the account, selected projects, tracking repo, `repoOwner` (default tracking repo owner for short code labels), `reposRoot` (where local clones live) and `branchPrefix`.
 - Refer to issues as `owner/repo#n` (bare `#n` means the tracking repo).
-- Use only `./scripts/yo-gh` (run from the workspace root) for project and issue changes: one plain command per call, no pipes, chaining, `$`, or backticks (a guard blocks them). Pass comment bodies as one quoted argument. Run it with no arguments for usage.
+- Use only direct `./scripts/yo-gh` commands from the workspace root for project and issue changes: one plain command per call, no `bash` or `wsl.exe` wrapper, pipes, chaining, `$`, or backticks (the guard checks the command path and blocks these). Pass comment bodies as one quoted argument. Run it with no arguments for usage.
 - `YO_PROJECT` pins one project. When omitted, `yo-gh` discovers active (non-closed) projects owned by `YO_OWNER`, falling back to the tracking repo owner. `YO_REPO_OWNER` only controls short `repo:<name>` labels. Reads preserve one row per project membership; an issue in several projects may appear several times. `setup`, `status`, `priority`, and `create` apply to every discovered project; `create` creates the issue once. Multi-project writes are best-effort and may partially succeed.
 
 | Command | Purpose |
