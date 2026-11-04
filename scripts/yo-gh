@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# Thin wrapper over `gh` for the GitHub Project behind the yo- commands.
+set -euo pipefail
+
+die() { echo "yo-gh: $*" >&2; exit 1; }
+
+YO_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+[[ ! -f "$YO_HOME/yo.env" ]] || source "$YO_HOME/yo.env"
+
+origin_repo() {
+  git -C "$YO_HOME" remote get-url origin 2>/dev/null \
+    | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##' || true
+}
+
+# The tracking repo holds goals (milestones) and issues without a home repo of their own.
+HOME_REPO="${YO_REPO:-$(origin_repo)}"
+[[ "$HOME_REPO" == */* ]] || die "cannot tell the tracking repo; set YO_REPO=owner/repo in yo.env"
+OWNER="${YO_OWNER:-${HOME_REPO%%/*}}"
+REPO_OWNER="${YO_REPO_OWNER:-${HOME_REPO%%/*}}"
+PROJECT="${YO_PROJECT:-}"
+[[ -z "$PROJECT" || "$PROJECT" =~ ^[0-9]+$ ]] || die "YO_PROJECT must be a project number"
+PROJECT_LIMIT=200
+ITEM_LIMIT=200
+PROJECT_TARGETS_JSON=''
+
+STATUSES='[["Backlog","GRAY"],["Todo","BLUE"],["Plan review","YELLOW"],["Approved","GREEN"],["In Progress","PURPLE"],["Human review","ORANGE"],["Waiting feedback","PINK"],["Blocked","RED"],["Done","GREEN"]]'
+PRIORITIES='["DO NOW","Urgent","High","Medium","Low"]'
+
+usage() {
+  cat <<'EOF'
+Usage: yo-gh <command> [args]   (ref = 12 | owner/repo#12; bare numbers mean the tracking repo)
+
+  config                         Account, projects, tracking repo, clones folder, branch prefix
+  resolve-repos <repo:NAME>...   Resolve code repo labels (default owner: tracking repo owner)
+  setup                          Ensure Status options and Priority in each project
+  today                          Open items from each project, one JSON object per line
+  next                           Highest-priority Todo item across projects
+  show <ref>                     Issue, comments, sub-issues, parent, goal, project memberships
+  create <title> [--repo R] [--body B] [--status S] [--priority P] [--label L]... [--milestone G] [--parent REF]  Create once in selected projects
+  status <ref> <Status>          Set Status in each project
+  priority <ref> <Priority>      Set Priority in each project
+  comment <ref> <body|->         Add an issue comment ("-" reads stdin)
+  sub-add <parent> <child>       Link an existing issue as a sub-issue
+  goals                          Goals (milestones of the tracking repo) with progress
+  goal-create <title> [--due YYYY-MM-DD] [--desc "done when ..."]
+  milestone <ref> <goal|none>    Set or clear an issue's goal (the milestone must exist in that issue's repo)
+EOF
+}
+
+# Sets REPO and NUM from an issue ref.
+parse_ref() {
+  if [[ "$1" =~ ^([^/#]+/[^/#]+)#([0-9]+)$ ]]; then
+    REPO="${BASH_REMATCH[1]}"; NUM="${BASH_REMATCH[2]}"
+  elif [[ "$1" =~ ^#?([0-9]+)$ ]]; then
+    REPO="$HOME_REPO"; NUM="${BASH_REMATCH[1]}"
+  else
+    die "bad issue ref '$1' (use 12 or owner/repo#12)"
+  fi
+}
+
+# Adding is idempotent: an issue already in the project returns its existing item.
+project_targets() {
+  if [[ -n "$PROJECT_TARGETS_JSON" ]]; then
+    printf '%s\n' "$PROJECT_TARGETS_JSON"
+    return
+  fi
+  if [[ -n "$PROJECT" ]]; then
+    PROJECT_TARGETS_JSON=$(gh project view "$PROJECT" --owner "$OWNER" --format json |
+      jq -c '[{number, title}]') || return 1
+  else
+    local listed count
+    listed=$(gh project list --owner "$OWNER" --limit "$PROJECT_LIMIT" --format json) || return 1
+    count=$(jq 'if type == "array" then length else (.projects // []) | length end' <<<"$listed") || return 1
+    if [[ "$count" -ge "$PROJECT_LIMIT" ]]; then
+      echo "yo-gh: project discovery reached its limit of $PROJECT_LIMIT; results may be incomplete" >&2
+    fi
+    PROJECT_TARGETS_JSON=$(jq -c 'if type == "array" then . else (.projects // []) end | map({number, title})' <<<"$listed") || return 1
+  fi
+  printf '%s\n' "$PROJECT_TARGETS_JSON"
+}
+
+require_project_targets() {
+  local targets
+  targets=$(project_targets)
+  [[ "$(jq 'length' <<<"$targets")" -gt 0 ]] || die "no active projects for $OWNER; set YO_PROJECT to a project number"
+}
+
+project_items() {
+  gh project item-list "$1" --owner "$OWNER" --limit "$ITEM_LIMIT" --format json
+}
+
+# Adding is idempotent: an issue already in the project returns its existing item.
+item_id() {
+  gh project item-add "$1" --owner "$OWNER" \
+    --url "https://github.com/$REPO/issues/$NUM" --format json --jq .id
+}
+
+# Uses REPO and NUM; matches the option name case-insensitively.
+set_field_in_project() {
+  local project_number="$1" field_name="$2" value="$3"
+  local fields fid oid pid item valid
+  fields=$(gh project field-list "$project_number" --owner "$OWNER" --format json) || {
+    echo "yo-gh: could not read fields for project #$project_number" >&2
+    return 1
+  }
+  fid=$(jq -r --arg n "$field_name" '.fields[] | select(.name == $n) | .id' <<<"$fields")
+  [[ -n "$fid" ]] || { echo "yo-gh: project #$project_number has no '$field_name' field (try: yo-gh setup)" >&2; return 1; }
+  oid=$(jq -r --arg n "$field_name" --arg o "$value" \
+    '.fields[] | select(.name == $n) | .options[]? | select(.name | ascii_downcase == ($o | ascii_downcase)) | .id' <<<"$fields")
+  if [[ -z "$oid" ]]; then
+    valid=$(jq -r --arg n "$field_name" '.fields[] | select(.name == $n) | [.options[].name] | join(", ")' <<<"$fields")
+    echo "yo-gh: invalid $field_name '$value' for project #$project_number; valid: $valid" >&2
+    return 1
+  fi
+  pid=$(gh project view "$project_number" --owner "$OWNER" --format json --jq .id) || {
+    echo "yo-gh: could not read project #$project_number id" >&2
+    return 1
+  }
+  item=$(item_id "$project_number") || {
+    echo "yo-gh: could not add $REPO#$NUM to project #$project_number" >&2
+    return 1
+  }
+  gh project item-edit --id "$item" --project-id "$pid" --field-id "$fid" \
+    --single-select-option-id "$oid" >/dev/null || {
+    echo "yo-gh: could not set $field_name for $REPO#$NUM in project #$project_number" >&2
+    return 1
+  }
+}
+
+set_field() {
+  local field_name="$1" value="$2" targets target number successes='' failures=''
+  require_project_targets
+  targets=$(project_targets)
+  while IFS= read -r target; do
+    number=$(jq -r '.number' <<<"$target")
+    if set_field_in_project "$number" "$field_name" "$value"; then
+      successes+="${successes:+, }#$number"
+    else
+      failures+="${failures:+, }#$number"
+    fi
+  done < <(jq -c '.[]' <<<"$targets")
+  if [[ -n "$failures" ]]; then
+    echo "yo-gh: $field_name succeeded in ${successes:-no projects}; failed in $failures" >&2
+    return 1
+  fi
+  echo "Updated $field_name in projects $successes" >&2
+}
+
+items() {
+  local targets target number title page count result='{"items":[]}'
+  targets=$(project_targets)
+  while IFS= read -r target; do
+    number=$(jq -r '.number' <<<"$target")
+    title=$(jq -r '.title' <<<"$target")
+    page=$(project_items "$number") || return 1
+    count=$(jq '.items | length' <<<"$page") || return 1
+    if [[ "$count" -ge "$ITEM_LIMIT" ]]; then
+      echo "yo-gh: project #$number reached its item limit of $ITEM_LIMIT; results may be incomplete" >&2
+    fi
+    result=$(jq -cn --argjson current "$result" --argjson page "$page" --argjson number "$number" --arg title "$title" \
+      '{items: ($current.items + [$page.items[] | . + {project: {number: $number, title: $title}}])}') || return 1
+  done < <(jq -c '.[]' <<<"$targets")
+  printf '%s\n' "$result"
+}
+
+resolve_repo_labels() {
+  jq -c --arg owner "$REPO_OWNER" '
+    map(
+      if startswith("repo:") then ltrimstr("repo:") else error("expected repo:<name> label") end
+      | if contains("/") then . else $owner + "/" + . end
+      | if test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$") and
+           (split("/")[1] != "." and split("/")[1] != "..")
+        then . else error("invalid repository label") end
+    ) | unique_by(ascii_downcase)'
+}
+
+cmd_resolve_repos() {
+  jq -cn --args '$ARGS.positional' "$@" | resolve_repo_labels
+}
+
+cmd_config() {
+  local prefix="${YO_BRANCH_PREFIX:-}" login project_json=null projects
+  if [[ -z "$prefix" ]]; then
+    login=$(gh api user --jq .login)
+    prefix=$(tr '[:upper:]' '[:lower:]' <<<"${login%%_*}")
+  fi
+  projects=$(project_targets)
+  [[ -z "$PROJECT" ]] || project_json="$PROJECT"
+  jq -n --arg owner "$OWNER" --arg repoOwner "$REPO_OWNER" --argjson project "$project_json" --argjson projects "$projects" --arg repo "$HOME_REPO" \
+    --arg root "${YO_REPOS_ROOT:-$(dirname "$YO_HOME")}" --arg prefix "$prefix" --arg home "$YO_HOME" \
+    '{owner: $owner, repoOwner: $repoOwner, project: $project, projects: $projects, trackingRepo: $repo, reposRoot: $root, branchPrefix: $prefix, home: $home}'
+}
+
+ensure_status_options() {
+  local project_number="$1" fields fid missing count opts page
+  fields=$(gh project field-list "$project_number" --owner "$OWNER" --format json) || {
+    echo "yo-gh: could not read fields for project #$project_number" >&2
+    return 1
+  }
+  fid=$(jq -r '.fields[] | select(.name == "Status") | .id' <<<"$fields")
+  [[ -n "$fid" ]] || { echo "yo-gh: project #$project_number has no Status field" >&2; return 1; }
+  missing=$(jq -r --argjson want "$STATUSES" '
+    ([.fields[] | select(.name == "Status") | .options[].name]) as $have
+    | [$want[][0] | select(. as $s | $have | index($s) | not)] | join(", ")' <<<"$fields")
+  if [[ -z "$missing" ]]; then
+    echo "Project #$project_number: Status options already complete"
+    return
+  fi
+  page=$(project_items "$project_number") || {
+    echo "yo-gh: could not list items in project #$project_number" >&2
+    return 1
+  }
+  count=$(jq '.items | length' <<<"$page")
+  if [[ "$count" -gt 0 ]]; then
+    # Rewriting the options would clear the Status of existing items.
+    echo "Project #$project_number: add these Status options in project settings (Status field): $missing"
+    return
+  fi
+  opts=$(jq -c --argjson want "$STATUSES" -n '[$want[] | {name: .[0], color: .[1], description: ""}]')
+  if ! jq -n --arg f "$fid" --argjson o "$opts" '{
+      query: "mutation($f: ID!, $o: [ProjectV2SingleSelectFieldOptionInput!]!) { updateProjectV2Field(input: {fieldId: $f, singleSelectOptions: $o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }",
+      variables: {f: $f, o: $o}}' | gh api graphql --input - >/dev/null; then
+    echo "yo-gh: could not update Status options in project #$project_number" >&2
+    return 1
+  fi
+  echo "Project #$project_number: Status options set"
+}
+
+cmd_setup() {
+  local num targets target number fields failed=0
+  if [[ -n "$PROJECT" ]] && ! gh project view "$PROJECT" --owner "$OWNER" >/dev/null 2>&1; then
+    num=$(gh project create --owner "$OWNER" --title TODO --format json | jq -r .number)
+    echo "Created project #$num; set YO_PROJECT=$num in yo.env"
+    PROJECT="$num"
+    PROJECT_TARGETS_JSON=''
+  fi
+  require_project_targets
+  targets=$(project_targets)
+  while IFS= read -r target; do
+    number=$(jq -r '.number' <<<"$target")
+    if ! ensure_status_options "$number"; then
+      failed=1
+    fi
+    if ! fields=$(gh project field-list "$number" --owner "$OWNER" --format json); then
+      echo "yo-gh: could not read fields for project #$number" >&2
+      failed=1
+    elif jq -e '.fields[] | select(.name == "Priority")' >/dev/null <<<"$fields"; then
+      echo "Project #$number: Priority field already exists"
+    elif gh project field-create "$number" --owner "$OWNER" --name Priority \
+      --data-type SINGLE_SELECT --single-select-options "$(jq -r 'join(",")' <<<"$PRIORITIES")" >/dev/null; then
+      echo "Project #$number: Priority field created"
+    else
+      echo "yo-gh: could not create Priority field for project #$number" >&2
+      failed=1
+    fi
+  done < <(jq -c '.[]' <<<"$targets")
+  return "$failed"
+}
+
+cmd_today() {
+  items | jq -c '.items[] | select(.content.number and .status != "Done")
+    | {ref: (.content.repository + "#" + (.content.number | tostring)), title, status, priority: (.priority // null), goal: (.milestone.title // null), url: .content.url, project}'
+}
+
+cmd_next() {
+  items | jq -c --argjson order "$PRIORITIES" '
+    [.items[] | select(.status == "Todo" and .content.number)]
+    | sort_by([(.priority as $p | ($order | index($p)) // 99), .project.number, .content.repository, .content.number])
+    | .[0] // empty
+    | {ref: (.content.repository + "#" + (.content.number | tostring)), title, priority: (.priority // null), goal: (.milestone.title // null), url: .content.url, project}'
+}
+
+cmd_show() {
+  parse_ref "$1"
+  local issue subs parent status memberships repos
+  issue=$(gh issue view "$NUM" -R "$REPO" --json number,title,body,state,url,labels,assignees,milestone,comments)
+  repos=$(jq '[.labels[]? | .name | select(startswith("repo:"))]' <<<"$issue" | resolve_repo_labels)
+  subs=$(gh api "repos/$REPO/issues/$NUM/sub_issues" --jq '[.[] | {ref: ((.repository_url | sub("https://api.github.com/repos/"; "")) + "#" + (.number | tostring)), title, state}]' 2>/dev/null) || subs='[]'
+  parent=$(gh api "repos/$REPO/issues/$NUM/parent" --jq '{ref: ((.repository_url | sub("https://api.github.com/repos/"; "")) + "#" + (.number | tostring)), title}' 2>/dev/null) || parent=null
+  memberships=$(items | jq -c --arg r "$REPO" --argjson n "$NUM" \
+    '[.items[] | select(.content.repository == $r and .content.number == $n) | {number: .project.number, title: .project.title, status, priority: (.priority // null)}]')
+  status=null
+  if [[ "$(jq 'length' <<<"$memberships")" -eq 1 ]]; then
+    status=$(jq -c '.[0] | {status, priority}' <<<"$memberships")
+  fi
+  jq -n --argjson i "$issue" --argjson s "$subs" --argjson p "$parent" --argjson st "$status" --argjson m "$memberships" --argjson repos "$repos" \
+    '$i + {sub_issues: $s, parent: $p, project: $st, project_memberships: $m, repos: $repos}'
+}
+
+cmd_create() {
+  local title="${1:-}" repo="$HOME_REPO" body="" status="Backlog" priority="" parent=""
+  local extra=()
+  [[ -n "$title" ]] || die "create needs a title"
+  shift
+  while [[ $# -gt 0 ]]; do
+    [[ $# -ge 2 ]] || die "missing value for $1"
+    case "$1" in
+      --repo) repo="$2" ;;
+      --body) body="$2" ;;
+      --status) status="$2" ;;
+      --priority) priority="$2" ;;
+      --label) extra+=(--label "$2") ;;
+      --milestone) extra+=(--milestone "$2") ;;
+      --parent) parent="$2" ;;
+      *) die "unknown option $1" ;;
+    esac
+    shift 2
+  done
+  local url failed=0
+  require_project_targets
+  url=$(gh issue create -R "$repo" --title "$title" --body "$body" ${extra[@]+"${extra[@]}"})
+  REPO="$repo"; NUM="${url##*/}"
+  if ! set_field Status "$status"; then failed=1; fi
+  if [[ -n "$priority" ]] && ! set_field Priority "$priority"; then failed=1; fi
+  if [[ -n "$parent" ]] && ! cmd_sub_add "$parent" "$repo#$NUM" >/dev/null; then failed=1; fi
+  echo "$url"
+  return "$failed"
+}
+
+cmd_status() { parse_ref "$1"; set_field Status "$2"; }
+cmd_priority() { parse_ref "$1"; set_field Priority "$2"; }
+
+cmd_comment() {
+  parse_ref "$1"
+  local body="${2:-}"
+  if [[ "$body" == "-" ]]; then
+    gh issue comment "$NUM" -R "$REPO" --body-file -
+  else
+    [[ -n "$body" ]] || die "comment needs a body"
+    printf '%s' "$body" | gh issue comment "$NUM" -R "$REPO" --body-file -
+  fi
+}
+
+cmd_sub_add() {
+  parse_ref "$1"
+  local prepo="$REPO" pnum="$NUM" cid
+  parse_ref "$2"
+  cid=$(gh api "repos/$REPO/issues/$NUM" --jq .id)
+  gh api -X POST "repos/$prepo/issues/$pnum/sub_issues" -F sub_issue_id="$cid" --jq .html_url
+}
+
+cmd_goals() {
+  gh api "repos/$HOME_REPO/milestones?state=all&per_page=100" \
+    | jq -c '.[] | {title, state, due: .due_on, done_when: .description, open: .open_issues, closed: .closed_issues, url: .html_url}'
+}
+
+cmd_goal_create() {
+  local title="${1:-}" due="" desc=""
+  [[ -n "$title" ]] || die "goal-create needs a title"
+  shift
+  while [[ $# -gt 0 ]]; do
+    [[ $# -ge 2 ]] || die "missing value for $1"
+    case "$1" in
+      --due) due="$2" ;;
+      --desc) desc="$2" ;;
+      *) die "unknown option $1" ;;
+    esac
+    shift 2
+  done
+  local args=(-f "title=$title" -f "description=$desc")
+  if [[ -n "$due" ]]; then
+    [[ "$due" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--due must be YYYY-MM-DD"
+    args+=(-f "due_on=${due}T12:00:00Z")
+  fi
+  gh api -X POST "repos/$HOME_REPO/milestones" "${args[@]}" --jq .html_url
+}
+
+cmd_milestone() {
+  parse_ref "$1"
+  if [[ "$2" == "none" ]]; then
+    gh issue edit "$NUM" -R "$REPO" --remove-milestone >/dev/null
+  else
+    gh issue edit "$NUM" -R "$REPO" --milestone "$2" >/dev/null
+  fi
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 1; }
+shift
+case "$cmd" in
+  config) cmd_config ;;
+  resolve-repos) [[ $# -ge 1 ]] || die "resolve-repos <repo:NAME>..."; cmd_resolve_repos "$@" ;;
+  setup) cmd_setup ;;
+  today) cmd_today ;;
+  next) cmd_next ;;
+  show) [[ $# -eq 1 ]] || die "show <ref>"; cmd_show "$1" ;;
+  create) cmd_create "$@" ;;
+  status) [[ $# -eq 2 ]] || die "status <ref> <Status>"; cmd_status "$1" "$2" ;;
+  priority) [[ $# -eq 2 ]] || die "priority <ref> <Priority>"; cmd_priority "$1" "$2" ;;
+  comment) [[ $# -ge 1 ]] || die "comment <ref> <body|->"; cmd_comment "$1" "${2:-}" ;;
+  sub-add) [[ $# -eq 2 ]] || die "sub-add <parent> <child>"; cmd_sub_add "$1" "$2" ;;
+  goals) cmd_goals ;;
+  goal-create) [[ $# -ge 1 ]] || die "goal-create <title> [--due D] [--desc T]"; cmd_goal_create "$@" ;;
+  milestone) [[ $# -eq 2 ]] || die "milestone <ref> <goal|none>"; cmd_milestone "$1" "$2" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
